@@ -10,48 +10,11 @@ import _thread
 import skvideo.io
 from queue import Queue, Empty
 from model.pytorch_msssim import ssim_matlab
+import subprocess ### CAMBIO ###: Importamos la librería para manejar subprocesos (ffmpeg)
 
 warnings.filterwarnings("ignore")
 
-def transferAudio(sourceVideo, targetVideo):
-    import shutil
-    import moviepy.editor
-    tempAudioFileName = "./temp/audio.mkv"
-
-    # split audio from original video file and store in "temp" directory
-    if True:
-
-        # clear old "temp" directory if it exits
-        if os.path.isdir("temp"):
-            # remove temp directory
-            shutil.rmtree("temp")
-        # create new "temp" directory
-        os.makedirs("temp")
-        # extract audio from video
-        os.system('ffmpeg -y -i "{}" -c:a copy -vn {}'.format(sourceVideo, tempAudioFileName))
-
-    targetNoAudio = os.path.splitext(targetVideo)[0] + "_noaudio" + os.path.splitext(targetVideo)[1]
-    os.rename(targetVideo, targetNoAudio)
-    # combine audio file and new video file
-    os.system('ffmpeg -y -i "{}" -i {} -c copy "{}"'.format(targetNoAudio, tempAudioFileName, targetVideo))
-
-    if os.path.getsize(targetVideo) == 0: # if ffmpeg failed to merge the video and audio together try converting the audio to aac
-        tempAudioFileName = "./temp/audio.m4a"
-        os.system('ffmpeg -y -i "{}" -c:a aac -b:a 160k -vn {}'.format(sourceVideo, tempAudioFileName))
-        os.system('ffmpeg -y -i "{}" -i {} -c copy "{}"'.format(targetNoAudio, tempAudioFileName, targetVideo))
-        if (os.path.getsize(targetVideo) == 0): # if aac is not supported by selected format
-            os.rename(targetNoAudio, targetVideo)
-            print("Audio transfer failed. Interpolated video will have no audio")
-        else:
-            print("Lossless audio transfer failed. Audio was transcoded to AAC (M4A) instead.")
-
-            # remove audio-less video
-            os.remove(targetNoAudio)
-    else:
-        os.remove(targetNoAudio)
-
-    # remove temp directory
-    shutil.rmtree("temp")
+### CAMBIO ###: La función transferAudio ha sido eliminada, ya que ffmpeg ahora maneja el audio y video juntos.
 
 parser = argparse.ArgumentParser(description='Interpolation for a pair of images')
 parser.add_argument('--video', dest='video', type=str, default=None)
@@ -122,13 +85,13 @@ if not args.video is None:
         fpsNotAssigned = False
     videogen = skvideo.io.vreader(args.video)
     lastframe = next(videogen)
-    fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
     video_path_wo_ext, ext = os.path.splitext(args.video)
     print('{}.{}, {} frames in total, {}FPS to {}FPS'.format(video_path_wo_ext, args.ext, tot_frame, fps, args.fps))
-    if args.png == False and fpsNotAssigned == True:
-        print("The audio will be merged after interpolation process")
+    if args.png == False:
+        print("Audio will be merged using ffmpeg.")
     else:
-        print("Will not merge audio because using png or fps flag!")
+        print("Will not merge audio because using png flag!")
+
 else:
     videogen = []
     for f in os.listdir(args.img):
@@ -138,9 +101,12 @@ else:
     videogen.sort(key= lambda x:int(x[:-4]))
     lastframe = cv2.imread(os.path.join(args.img, videogen[0]), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
     videogen = videogen[1:]
+
 h, w, _ = lastframe.shape
 vid_out_name = None
-vid_out = None
+### CAMBIO ###: Inicializamos la variable del proceso ffmpeg
+ffmpeg_process = None
+
 if args.png:
     if not os.path.exists('vid_out'):
         os.mkdir('vid_out')
@@ -148,8 +114,35 @@ else:
     if args.output is not None:
         vid_out_name = args.output
     else:
-        vid_out_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, (2 ** args.exp), int(np.round(args.fps)), args.ext)
-    vid_out = cv2.VideoWriter(vid_out_name, fourcc, args.fps, (w, h))
+        vid_out_name = '{}_{}X_{}fps.mp4'.format(video_path_wo_ext, (2 ** args.exp), int(np.round(args.fps)))
+
+    ### CAMBIO ###: Configuración y lanzamiento del proceso FFmpeg en lugar de cv2.VideoWriter
+    # Parámetros de calidad que puedes ajustar
+    crf = "20"  # Menor valor = más calidad. 18-24 es un buen rango.
+    preset = "slow" # Más lento = mejor compresión. 'medium', 'fast', 'slow', etc.
+    
+    command = [
+        'ffmpeg',
+        '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', f'{w}x{h}',
+        '-pix_fmt', 'rgb24',
+        '-r', str(args.fps),
+        '-i', '-',
+        '-i', args.video,
+        '-map', '0:v:0',
+        '-map', '1:a:0?',
+        '-c:v', 'libx265',
+        '-preset', preset,
+        '-crf', crf,
+        '-c:a', 'copy',
+        '-pix_fmt', 'yuv420p',
+        vid_out_name
+    ]
+    
+    ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE)
+
 
 def clear_write_buffer(user_args, write_buffer):
     cnt = 0
@@ -161,7 +154,11 @@ def clear_write_buffer(user_args, write_buffer):
             cv2.imwrite('vid_out/{:0>7d}.png'.format(cnt), item[:, :, ::-1])
             cnt += 1
         else:
-            vid_out.write(item[:, :, ::-1])
+            ### CAMBIO ###: Escribimos el cuadro de video directamente a la tubería de ffmpeg
+            if ffmpeg_process is not None:
+                # OpenCV usa BGR, lo convertimos a RGB para ffmpeg y luego a bytes
+                frame_rgb = item[:, :, ::-1]
+                ffmpeg_process.stdin.write(frame_rgb.tobytes())
 
 def build_read_buffer(user_args, read_buffer, videogen):
     try:
@@ -210,7 +207,7 @@ _thread.start_new_thread(clear_write_buffer, (args, write_buffer))
 
 I1 = torch.from_numpy(np.transpose(lastframe, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
 I1 = pad_image(I1)
-temp = None # save lastframe when processing static frame
+temp = None
 
 while True:
     if temp is not None:
@@ -229,7 +226,7 @@ while True:
 
     break_flag = False
     if ssim > 0.996:        
-        frame = read_buffer.get() # read a new frame
+        frame = read_buffer.get()
         if frame is None:
             break_flag = True
             frame = lastframe
@@ -246,15 +243,6 @@ while True:
         output = []
         for i in range((2 ** args.exp) - 1):
             output.append(I0)
-        '''
-        output = []
-        step = 1 / (2 ** args.exp)
-        alpha = 0
-        for i in range((2 ** args.exp) - 1):
-            alpha += step
-            beta = 1-alpha
-            output.append(torch.from_numpy(np.transpose((cv2.addWeighted(frame[:, :, ::-1], alpha, lastframe[:, :, ::-1], beta, 0)[:, :, ::-1].copy()), (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.)
-        '''
     else:
         output = make_inference(I0, I1, 2**args.exp-1) if args.exp else []
 
@@ -284,14 +272,10 @@ import time
 while(not write_buffer.empty()):
     time.sleep(0.1)
 pbar.close()
-if not vid_out is None:
-    vid_out.release()
 
-# move audio to new video file if appropriate
-if args.png == False and fpsNotAssigned == True and not args.video is None:
-    try:
-        transferAudio(args.video, vid_out_name)
-    except:
-        print("Audio transfer failed. Interpolated video will have no audio")
-        targetNoAudio = os.path.splitext(vid_out_name)[0] + "_noaudio" + os.path.splitext(vid_out_name)[1]
-        os.rename(targetNoAudio, vid_out_name)
+### CAMBIO ###: Cerramos el proceso ffmpeg correctamente en lugar de vid_out.release()
+if ffmpeg_process is not None:
+    ffmpeg_process.stdin.close()
+    ffmpeg_process.wait()
+
+### CAMBIO ###: La sección final para mover el audio ha sido eliminada.```
